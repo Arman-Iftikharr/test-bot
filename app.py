@@ -1,168 +1,231 @@
-
 # app.py
 import os
-import requests
 import logging
+import requests
 from flask import Flask, request
 from dotenv import load_dotenv
 
-from database import save_message
-from nlp import detect_intent, extract_entities
-from ogra_api_official import get_today_prices, get_price_by_date
-from rag_engine import rag_answer
+from nlp import detect_intent, extract_entities, detect_category
+from ogra_scraper import (
+    get_petroleum_notifications,
+    get_e10_gasoline_notifications,
+    get_ifem_notifications,
+    get_ex_depot_notifications
+)
+from filters import filter_notifications
 
-# Load environment variables
+# --------------------------------------------------
+# ENV + APP
+# --------------------------------------------------
 load_dotenv()
 
 app = Flask(__name__)
 
-# Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ogra_bot")
+logger = logging.getLogger("ograbot")
+
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
-# -----------------------------------------------------------
-# 1) VERIFY WEBHOOK (GET)
-# -----------------------------------------------------------
+# --------------------------------------------------
+# In-memory user session
+# --------------------------------------------------
+USER_STATE = {}
+WELCOME_MESSAGE = (
+    "🤖 *Ograbot* – OGRA WhatsApp Assistant\n"
+    "(Oil & Gas Regulatory Authority – Pakistan)\n\n"
+    "Please choose a category:\n\n"
+    "1️⃣ Notified Petroleum Prices\n"
+    "2️⃣ E-10 Gasoline Prices\n"
+    "3️⃣ IFEM Notifications\n"
+    "4️⃣ Detail Computation Ex-Depot Sale Price\n\n"
+    "Examples:\n"
+    "• Petrol price May 2021\n"
+    "• Gas rate January 2017\n"
+    "• IFEM May 2021\n\n"
+    "Type `exit` anytime to restart 😊"
+)
+
+
+# --------------------------------------------------
+# Webhook Verification
+# --------------------------------------------------
 @app.get("/webhook")
 def verify_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        logger.info("Webhook verified successfully.")
-        return challenge, 200
-
-    logger.warning("Webhook verification failed.")
+    if (
+        request.args.get("hub.mode") == "subscribe"
+        and request.args.get("hub.verify_token") == VERIFY_TOKEN
+    ):
+        return request.args.get("hub.challenge"), 200
     return "verification failed", 403
 
-# -----------------------------------------------------------
-# 2) HANDLE INCOMING MESSAGES (POST)
-# -----------------------------------------------------------
+
+# --------------------------------------------------
+# Incoming WhatsApp Messages
+# --------------------------------------------------
 @app.post("/webhook")
 def incoming_message():
     data = request.get_json()
-    logger.info("Incoming Webhook: %s", data)
+    logger.info("Incoming webhook received")
 
     try:
-        entry = data.get("entry", [])[0]
-        change = entry.get("changes", [])[0].get("value", {})
+        change = data["entry"][0]["changes"][0]["value"]
 
-        # ignore statuses
-        if "statuses" in change:
-            logger.info("Status update received. Ignoring.")
-            return "ok", 200
-
-        # no messages? ignore
         if "messages" not in change:
-            logger.info("No message found. System/metadata event.")
             return "ok", 200
 
         msg = change["messages"][0]
-        sender = msg.get("from")
+        sender = msg["from"]
+        text = msg["text"]["body"].strip()
 
-        # safely extract text
-        text = msg.get("text", {}).get("body")
-        if not text:
-            logger.info(f"No text found in message from {sender}: {msg}")
-            return "ok", 200
+        logger.info("User message: %s", text)
 
-        logger.info("User %s said: %s", sender, text)
-
-        # Save to DB
-        save_message(sender, text)
-
-        # NLP
         intent = detect_intent(text)
         entities = extract_entities(text)
+        category = detect_category(text)
 
-        # Bot reply
-        reply = generate_reply(intent, entities, text)
+        # -------- MEMORY --------
+        last_category = USER_STATE.get(sender)
+
+        if category:
+            USER_STATE[sender] = category
+        elif last_category:
+            category = last_category
+
+        logger.info(
+            "Intent: %s | Category: %s | Entities: %s",
+            intent, category, entities
+        )
+
+        reply = generate_reply(sender, intent, entities, category)
         send_whatsapp_message(sender, reply)
 
     except Exception as e:
-        logger.exception("Error processing webhook: %s", e)
+        logger.exception("Webhook error: %s", e)
 
     return "ok", 200
 
-# -----------------------------------------------------------
-# 3) INTENT → RESPONSE HANDLER (IMPROVED)
-# -----------------------------------------------------------
-def generate_reply(intent, entities, user_input):
-    logger.info("Intent: %s | Entities: %s", intent, entities)
 
-    # --------------------------
-    # GREETING
-    # --------------------------
+# --------------------------------------------------
+# BOT LOGIC
+# --------------------------------------------------
+def generate_reply(sender, intent, entities, category):
+
+    # -------- EXIT --------
+    if intent == "restart":
+        USER_STATE.pop(sender, None)
+        return WELCOME_MESSAGE
+
+    # -------- GREETING --------
     if intent == "greeting":
+        return WELCOME_MESSAGE
+
+    # -------- MENU HANDLERS --------
+    if intent == "petroleum_menu":
+        USER_STATE[sender] = "petroleum"
         return (
-            "Hello 👋\n"
-            "I can help you with:\n"
-            "• Today's petrol & diesel prices\n"
-            "• Historical price for any date\n"
-            "\nExample: 'What's today's price?' or 'Price on 2024-11-01'"
+            "🛢️ *Notified Petroleum Prices selected*\n\n"
+            "Tell me the time period:\n"
+            "• May 2021\n"
+            "• January 2017\n"
+            "• Latest"
         )
 
-    # --------------------------
-    # TODAY'S PRICE
-    # --------------------------
-    if intent == "today_price":
-        data = get_today_prices()
-        if not data:
-            return "⚠️ Unable to fetch today's fuel prices. Please try again later."
-        return rag_answer("today_prices", data)
+    if intent == "e10_menu":
+        USER_STATE[sender] = "e10"
+        return (
+            "⛽ *E-10 Gasoline Prices selected*\n\n"
+            "Tell me the time period:\n"
+            "• May 2021\n"
+            "• January 2017\n"
+            "• Latest"
+        )
 
-    # --------------------------
-    # PRICE BY DATE
-    # --------------------------
-    if intent == "date_price":
-        date = entities.get("date")
+    if intent == "ifem_menu":
+        USER_STATE[sender] = "ifem"
+        return (
+            "📄 *IFEM Notifications selected*\n\n"
+            "Tell me the time period:\n"
+            "• May 2021\n"
+            "• January 2017\n"
+            "• Latest"
+        )
 
-        if not date:
-            return (
-                "📅 Please provide a date in *YYYY-MM-DD* format.\n"
-                "Example: 2025-11-01"
-            )
+    if intent == "ex_depot_menu":
+        USER_STATE[sender] = "ex_depot"
+        return (
+            "📊 *Detail Computation Ex-Depot Prices selected*\n\n"
+            "Tell me the time period:\n"
+            "• May 2021\n"
+            "• Latest"
+        )
 
-        data = get_price_by_date(date)
-        if not data:
-            return f"⚠️ Sorry, I couldn't find data for {date}. Try another date."
+    # -------- DATA SOURCE --------
+    if category == "e10":
+        notifications = get_e10_gasoline_notifications(limit=300)
+        title = "E-10 Gasoline"
+    elif category == "ifem":
+        notifications = get_ifem_notifications(limit=300)
+        title = "IFEM"
+    elif category == "ex_depot":
+        notifications = get_ex_depot_notifications(limit=300)
+        title = "Ex-Depot Sale Price"
+    else:
+        notifications = get_petroleum_notifications(limit=300)
+        title = "Petroleum"
 
-        return rag_answer("historical_price", data)
+    logger.info("Total scraped notifications: %d", len(notifications))
 
-    # --------------------------
-    # PRICE QUERY (general)
-    # --------------------------
-    if intent == "pricing":
-        data = get_today_prices()
-        if not data:
-            return "⚠️ Could not retrieve current fuel prices."
-        return rag_answer("pricing", data)
+    # -------- UX POLISH --------
+    if intent == "unknown" and category:
+        return (
+            f"📌 *{title} selected*\n\n"
+            "You can ask:\n"
+            "• Latest\n"
+            "• May 2021\n"
+            "• January 2017\n\n"
+            "Type `exit` to restart"
+        )
 
-    # --------------------------
-    # UNKNOWN INTENT (fallback)
-    # --------------------------
+    # -------- LATEST --------
+    if intent == "latest":
+        reply = f"📊 Latest OGRA {title} Notifications:\n\n"
+        for n in notifications[:5]:
+            reply += f"• {n['title']}\n{n['link']}\n\n"
+        return reply
+
+    # -------- DATE QUERY --------
+    if intent == "date_query":
+        results = filter_notifications(notifications, entities)
+
+        if not results:
+            return "❌ No OGRA notifications found for your query."
+
+        reply = f"📅 OGRA {title} Notifications:\n\n"
+        for r in results[:10]:
+            reply += f"• {r['title']}\n{r['link']}\n\n"
+        return reply
+
+    # -------- FALLBACK --------
     return (
-        "❓ I couldn't understand that.\n"
-        "Try asking:\n"
-        "• 'Today petrol price?'\n"
-        "• 'Fuel prices today'\n"
-        "• 'Price on 2025-05-01'"
+        "❓ I didn’t understand that.\n\n"
+        "Try:\n"
+        "• Latest\n"
+        "• May 2021\n"
+        "• IFEM January 2017\n"
+        "• exit"
     )
 
-# -----------------------------------------------------------
-# 4) SEND MESSAGE USING WHATSAPP CLOUD API
-# -----------------------------------------------------------
-# 4) SEND MESSAGE USING WHATSAPP CLOUD API (MODIFIED FOR DEBUGGING)
+
+# --------------------------------------------------
+# Send WhatsApp Message
+# --------------------------------------------------
 def send_whatsapp_message(to, message):
-    # Ensure 'to' number starts with the plus sign
-    if not to.startswith('+'):
-        to = f'+{to}'
-    
+    if not to.startswith("+"):
+        to = f"+{to}"
+
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
 
     payload = {
@@ -176,22 +239,12 @@ def send_whatsapp_message(to, message):
         "Content-Type": "application/json",
     }
 
-    try:
-        res = requests.post(url, json=payload, headers=headers, timeout=10)
-        res.raise_for_status()
-        logger.info(f"Sent message to {to} successfully.")
-    except requests.exceptions.HTTPError as e:
-        # This block catches errors like 400, 401, 403, 404 from the API
-        logger.error(f"Failed to send WhatsApp message (HTTP Error): {e}")
-        logger.error(f"Response Body: {res.text}") # <-- THIS WILL SHOW META'S ERROR MESSAGE
-    except Exception as e:
-        logger.exception("Failed to send WhatsApp message (Generic Error): %s", e)
+    response = requests.post(url, json=payload, headers=headers, timeout=10)
+    logger.info("WhatsApp API response: %s", response.status_code)
 
 
-# -----------------------------------------------------------
-# 5) START FLASK SERVER
-# -----------------------------------------------------------
+# --------------------------------------------------
+# Run App
+# --------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
-
+    app.run(host="0.0.0.0", port=5000)
